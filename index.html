@@ -1,0 +1,696 @@
+<!DOCTYPE html>
+<html>
+
+<head>
+    <meta charset="UTF-8" />
+    <title>P2P Bomberman Game</title>
+    <style>
+        body {
+            background: #013222;
+            /* dark blue page background */
+            margin: 0;
+            padding: 0;
+            font-family: Arial, sans-serif;
+            color: white;
+        }
+
+        canvas {
+            background: black;
+            display: block;
+            margin: auto;
+            margin-top: 20px;
+        }
+
+        #controls {
+            text-align: center;
+            margin-top: 20px;
+        }
+
+        #peerIdDisplay {
+            text-align: center;
+            margin-top: 10px;
+            font-weight: bold;
+        }
+    </style>
+</head>
+
+<body>
+    <canvas id="gameCanvas"></canvas>
+    <div id="controls">
+        <input type="text" id="peerIdInput" placeholder="Enter peer id to connect" />
+        <button id="connectButton">Connect</button>
+    </div>
+    <div id="peerIdDisplay"></div>
+
+    <!-- Include PeerJS library -->
+    <script src="https://unpkg.com/peerjs@1.3.1/dist/peerjs.min.js"></script>
+    <script>
+        "use strict";
+        /***** Global Settings *****/
+        const canvas = document.getElementById("gameCanvas");
+        const ctx = canvas.getContext("2d");
+
+        // Grid settings.
+        const cellSize = 40;
+        const cols = 22; // Define cols directly
+        const rows = 15; // Define rows directly
+
+        // Set canvas width and height based on cols and rows
+        canvas.width = cols * cellSize;
+        canvas.height = rows * cellSize;
+
+
+        // Global game state.
+        let level = null; // 2D array: 0 = empty, 1 = block.
+        let bombs = []; // Bombs: { x, y, timer, owner }
+        let explosions = []; // Explosions: { cells: [ {x, y}, ... ], timer }
+        let players = {}; // Players keyed by peer id.
+        let orbs = []; // Bonus orb positions: [{x, y}, ...]
+
+        // Local player state.
+        let localId = null;
+        let localPlayer = null; // { id, x, y, color, isDead, deathTime, maxBombs, activeBombs }
+
+        // Global host id.
+        let hostId = null;
+
+        // Flag to indicate if we are joining someone else’s game.
+        let joinedGame = false;
+
+        // Input state.
+        let pendingMove = null; // "up", "down", "left", "right"
+        let bombDrop = false; // true when SPACE is pressed
+        let lastMoveKey = null; // Track last move key pressed
+
+        /***** Level & Spawn Functions *****/
+        function generateLevel() {
+            let board = [];
+            const spawns = [{
+                    x: 1,
+                    y: 1
+                },
+                {
+                    x: cols - 2,
+                    y: 1
+                },
+                {
+                    x: 1,
+                    y: rows - 2
+                },
+                {
+                    x: cols - 2,
+                    y: rows - 2
+                }
+            ];
+            for (let r = 0; r < rows; r++) {
+                board[r] = [];
+                for (let c = 0; c < cols; c++) {
+                    let reserved = spawns.some(spawn => (Math.abs(c - spawn.x) <= 1 && Math.abs(r - spawn.y) <= 1));
+                    board[r][c] = reserved ? 0 : (Math.random() < 0.3 ? 1 : 0);
+                }
+            }
+            return board;
+        }
+
+        function getValidSpawnPosition() {
+            let valid = false;
+            let pos;
+            while (!valid) {
+                const x = Math.floor(Math.random() * cols);
+                const y = Math.floor(Math.random() * rows);
+                pos = {
+                    x,
+                    y
+                };
+                valid = true;
+                if (level && level[y][x] === 1) valid = false;
+                for (let id in players) {
+                    let p = players[id];
+                    if (p.x === x && p.y === y) {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            return pos;
+        }
+
+        function getPlayerSpawnPosition() {
+            let valid = false;
+            let pos;
+            const minDistance = 3;
+            while (!valid) {
+                let x = Math.floor(Math.random() * cols);
+                let y = Math.floor(Math.random() * rows);
+                if (level && level[y][x] === 1) continue;
+                let tooClose = false;
+                for (let id in players) {
+                    let p = players[id];
+                    if (p.isDead) continue;
+                    let dist = Math.abs(x - p.x) + Math.abs(y - p.y);
+                    if (dist < minDistance) {
+                        tooClose = true;
+                        break;
+                    }
+                }
+                let inExplosion = explosions.some(exp => exp.cells.some(cell => cell.x === x && cell.y === y));
+                if (!tooClose && !inExplosion) {
+                    valid = true;
+                    pos = {
+                        x,
+                        y
+                    };
+                }
+            }
+            return pos;
+        }
+
+        function spawnOrb() {
+            let pos = getValidSpawnPosition();
+            orbs.push(pos);
+        }
+
+        function processOrbCollection(player) {
+            for (let i = orbs.length - 1; i >= 0; i--) {
+                let orb = orbs[i];
+                if (player.x === orb.x && player.y === orb.y) {
+                    player.maxBombs++;
+                    orbs.splice(i, 1);
+                    broadcast({
+                        type: "orbs",
+                        orbs: orbs
+                    });
+                    break;
+                }
+            }
+        }
+
+        /***** Utility Functions *****/
+        function getRandomColor() {
+            const letters = "0123456789ABCDEF";
+            let color = "#";
+            for (let i = 0; i < 6; i++) {
+                color += letters[Math.floor(Math.random() * 16)];
+            }
+            return color;
+        }
+
+        function isCellFree(x, y) {
+            if (x < 0 || x >= cols || y < 0 || y >= rows) return false;
+            if (level[y][x] === 1) return false;
+            if (bombs.some(b => b.x === x && b.y === y)) return false;
+            // NEW: Check for other players in the cell, but EXCLUDE local player's position
+            for (let id in players) {
+                let p = players[id];
+                if (id !== localId && !p.isDead && p.x === x && p.y === y) { // Exclude local player ID
+                    return false; // Cell is occupied by another player
+                }
+            }
+            return true; // Cell is free if no wall, bomb, or *other* player
+        }
+
+        /***** Host Determination *****/
+        function getHostId() {
+            let ids = Object.keys(players);
+            if (ids.length === 0) return localId;
+            ids.sort();
+            return ids[0];
+        }
+
+        /***** PeerJS Setup *****/
+        const peer = new Peer();
+        let connections = {};
+
+        peer.on("open", (id) => {
+            localId = id;
+            console.log("My peer ID is: " + id);
+            document.getElementById("peerIdDisplay").innerText = "My Peer ID: " + id;
+
+            // Generate level only if it's the very first peer (host).
+            if (!level) {
+                level = generateLevel();
+            }
+            if (!hostId) hostId = localId; //ensure hostId is set for the first peer
+
+            let spawnPos = getPlayerSpawnPosition();
+            localPlayer = {
+                id: localId, // Use localId here
+                x: spawnPos.x,
+                y: spawnPos.y,
+                color: getRandomColor(),
+                isDead: false,
+                deathTime: 0,
+                maxBombs: 1,
+                activeBombs: 0
+            };
+            players[localId] = localPlayer; // Use localId as key
+
+        });
+
+        peer.on("connection", (conn) => {
+            setupConnection(conn);
+        });
+
+        document.getElementById("connectButton").addEventListener("click", () => {
+            joinedGame = true;
+            const targetId = document.getElementById("peerIdInput").value.trim();
+            if (targetId) {
+                const conn = peer.connect(targetId);
+                conn.on("open", () => {
+                    setupConnection(conn);
+                });
+            }
+        });
+
+        function setupConnection(conn) {
+            connections[conn.peer] = conn;
+
+            // Send host's level to the connecting peer IMMEDIATELY.
+            conn.send({
+                type: "board",
+                board: level
+            });
+
+            // Send other game state data.
+            conn.send({
+                type: "player",
+                player: localPlayer
+            });
+            conn.send({
+                type: "bombs",
+                bombs: bombs
+            });
+            conn.send({
+                type: "explosions",
+                explosions: explosions
+            });
+            // The person who is being connected to is ALWAYS the host
+            conn.send({
+                type: "host",
+                id: localId // Send the localId as hostId to the CONNECTING peer
+            });
+            conn.send({
+                type: "orbs",
+                orbs: orbs
+            });
+
+
+            conn.on("data", (data) => {
+                if (data.type === "host") {
+                    hostId = data.id; // Update hostId based on received data (for connector)
+                } else if (data.type === "board") {
+                    //  The connecting client ALWAYS updates their level with received board data.
+                    level = data.board;
+                } else if (data.type === "player") {
+                    players[data.player.id] = data.player;
+                } else if (data.type === "move") {
+                    if (players[data.id]) {
+                        players[data.id].x = data.x;
+                        players[data.id].y = data.y;
+                    }
+                } else if (data.type === "bomb") {
+                    let exists = bombs.some(b => b.x === data.bomb.x && data.bomb.y === data.bomb.y && b.owner === data.bomb.owner);
+                    if (!exists) bombs.push(data.bomb);
+                } else if (data.type === "explosion") {
+                    explosions.push(data.explosion);
+                } else if (data.type === "playerDeath") {
+                    if (players[data.id]) {
+                        players[data.id].isDead = true;
+                        players[data.id].deathTime = Date.now();
+                        players[data.id].maxBombs = 1; // Reset bomb count on death for remote players
+                        bombs = bombs.filter(b => b.owner !== data.id);
+                    }
+                } else if (data.type === "orbs") {
+                    orbs = data.orbs;
+                } else if (data.type === "removeBomb") {
+                    bombs = bombs.filter(b => !(b.x === data.bomb.x && data.bomb.y === data.bomb.y && b.owner === data.bomb.owner));
+                }
+            });
+
+            conn.on("close", () => {
+                delete players[conn.peer];
+                delete connections[conn.peer];
+            });
+        }
+
+        /***** Input Handling *****/
+        document.addEventListener("keydown", (e) => {
+            const key = e.key.toLowerCase();
+            if (key === "arrowup" || key === "w") {
+                if (lastMoveKey !== key) pendingMove = "up";
+                lastMoveKey = key;
+            } else if (key === "arrowdown" || key === "s") {
+                if (lastMoveKey !== key) pendingMove = "down";
+                lastMoveKey = key;
+            } else if (key === "arrowleft" || key === "a") {
+                if (lastMoveKey !== key) pendingMove = "left";
+                lastMoveKey = key;
+            } else if (key === "arrowright" || key === "d") {
+                if (lastMoveKey !== key) pendingMove = "right";
+                lastMoveKey = key;
+            } else if (e.key === " ") {
+                bombDrop = true;
+            }
+        });
+
+        document.addEventListener("keyup", (e) => {
+            const key = e.key.toLowerCase();
+            if (key === "arrowup" || key === "w" || key === "arrowdown" || key === "s" || key === "arrowleft" || key === "a" || key === "arrowright" || key === "d") {
+                lastMoveKey = null; // Reset last move key on keyup
+            }
+        });
+
+        /***** Game Logic *****/
+        const bombTimer = 2000; // Bomb countdown in ms.
+        const explosionTime = 500; // Explosion time in ms.
+        const bombRange = 3; // Explosion range in cells.
+
+        function update(delta) {
+            if (!localPlayer) return;
+
+            // Remove bombs from dead players.
+            bombs = bombs.filter(b => {
+                let owner = players[b.owner];
+                return owner && !owner.isDead;
+            });
+
+            // Process Explosions: destroy walls and kill players.
+            for (let i = explosions.length - 1; i >= 0; i--) {
+                explosions[i].cells.forEach(cell => {
+                    if (level[cell.y][cell.x] === 1) {
+                        level[cell.y][cell.x] = 0;
+                    }
+                    for (let id in players) {
+                        let p = players[id];
+                        if (!p.isDead && p.x === cell.x && p.y === cell.y) {
+                            p.isDead = true;
+                            p.deathTime = Date.now();
+                            broadcast({
+                                type: "playerDeath",
+                                id: p.id
+                            });
+                            bombs = bombs.filter(b => b.owner !== p.id);
+                        }
+                    }
+                });
+                explosions[i].timer -= delta;
+                if (explosions[i].timer <= 0) {
+                    explosions.splice(i, 1);
+                }
+            }
+
+            // Respawn Local Player if Dead (2-second delay).
+            if (localPlayer.isDead) {
+                if (Date.now() - localPlayer.deathTime >= 2000) {
+                    let spawnPos = getPlayerSpawnPosition();
+                    localPlayer.x = spawnPos.x;
+                    localPlayer.y = spawnPos.y;
+                    localPlayer.isDead = false;
+                    localPlayer.activeBombs = 0;
+                    localPlayer.maxBombs = 1; // Reset bomb count on respawn for local player
+                    broadcast({
+                        type: "player",
+                        player: localPlayer
+                    });
+                } else {
+                    return;
+                }
+            }
+
+            // Process Movement for Local Player.
+            if (pendingMove) {
+                let newX = localPlayer.x;
+                let newY = localPlayer.y;
+                if (pendingMove === "up") newY--;
+                else if (pendingMove === "down") newY++;
+                else if (pendingMove === "left") newX--;
+                else if (pendingMove === "right") newX++;
+                if (newX >= 0 && newX < cols && newY >= 0 && newY < rows && isCellFree(newX, newY)) { // Use isCellFree here
+                    localPlayer.x = newX;
+                    localPlayer.y = newY;
+                    processOrbCollection(localPlayer);
+                    broadcast({
+                        type: "move",
+                        id: localPlayer.id,
+                        x: newX,
+                        y: newY
+                    });
+                }
+                pendingMove = null; // Reset pendingMove HERE, after processing
+            }
+
+            // Process Bomb Drop for Local Player.
+            if (bombDrop) {
+                if (isCellFree(localPlayer.x, localPlayer.y) && localPlayer.activeBombs < localPlayer.maxBombs) {
+                    let bomb = {
+                        x: localPlayer.x,
+                        y: localPlayer.y,
+                        timer: bombTimer,
+                        owner: localId // Use localId here
+                    };
+                    bombs.push(bomb);
+                    localPlayer.activeBombs++;
+                    broadcast({
+                        type: "bomb",
+                        bomb: bomb
+                    });
+                }
+                bombDrop = false;
+            }
+
+            // Update Bombs.
+            for (let i = bombs.length - 1; i >= 0; i--) {
+                bombs[i].timer -= delta;
+                if (bombs[i].timer <= 0) {
+                    let bomb = bombs.splice(i, 1)[0];
+                    if (players[bomb.owner]) {
+                        players[bomb.owner].activeBombs = Math.max(0, players[bomb.owner].activeBombs - 1);
+                    }
+                    createExplosion(bomb);
+                    broadcast({
+                        type: "removeBomb",
+                        bomb: bomb
+                    });
+                }
+            }
+
+            // Host Spawns Orb.
+            if (localId === getHostId()) {
+                if (bombs.length === 0 && explosions.length === 0 && orbs.length < 1) {
+                    spawnOrb();
+                    broadcast({
+                        type: "orbs",
+                        orbs: orbs
+                    });
+                }
+            }
+
+            broadcast({
+                type: "player",
+                player: localPlayer
+            });
+        }
+
+        function createExplosion(bomb) {
+            let expCells = [];
+            expCells.push({
+                x: bomb.x,
+                y: bomb.y
+            });
+            let dirs = [{
+                    dx: 0,
+                    dy: -1
+                },
+                {
+                    dx: 0,
+                    dy: 1
+                },
+                {
+                    dx: -1,
+                    dy: 0
+                },
+                {
+                    dx: 1,
+                    dy: 0
+                }
+            ];
+            dirs.forEach(dir => {
+                for (let i = 1; i <= bombRange; i++) {
+                    let cx = bomb.x + dir.dx * i;
+                    let cy = bomb.y + dir.dy * i;
+                    if (cx < 0 || cx >= cols || cy < 0 || cy >= rows) break;
+                    expCells.push({
+                        x: cx,
+                        y: cy
+                    });
+                    if (level[cy][cx] === 1) break;
+                }
+            });
+            // Merge duplicate explosion cells.
+            let uniqueCells = [];
+            expCells.forEach(cell => {
+                if (!uniqueCells.some(c => c.x === cell.x && c.y === cell.y)) {
+                    uniqueCells.push(cell);
+                }
+            });
+            let explosion = {
+                cells: uniqueCells,
+                timer: explosionTime
+            };
+            explosions.push(explosion);
+            broadcast({
+                type: "explosion",
+                explosion: explosion
+            });
+        }
+
+        function broadcast(msg) {
+            for (let peerId in connections) {
+                connections[peerId].send(msg);
+            }
+        }
+
+        /***** Game Loop *****/
+        let lastUpdateTime = performance.now();
+        const updateInterval = 90; // in ms
+
+        function gameLoop(timestamp) {
+            let delta = timestamp - lastUpdateTime;
+            if (delta > updateInterval) {
+                update(delta);
+                lastUpdateTime = timestamp;
+            }
+            draw();
+            requestAnimationFrame(gameLoop);
+        }
+
+        /***** Rendering *****/
+        function draw() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            drawGrid();
+            drawLevel();
+            drawBombs();
+            drawExplosions();
+            drawPlayers();
+            drawOrbs();
+        }
+
+        function drawGrid() {
+            ctx.strokeStyle = "#555";
+            ctx.lineWidth = 0.5;
+            // Draw vertical grid lines, stop at cols * cellSize
+            for (let i = 0; i <= cols; i++) {
+                ctx.beginPath();
+                ctx.moveTo(i * cellSize, 0);
+                ctx.lineTo(i * cellSize, rows * cellSize); //stop at rows * cellSize
+                ctx.stroke();
+            }
+
+
+            // Draw horizontal grid lines, stop at rows * cellSize
+            for (let j = 0; j <= rows; j++) {
+                ctx.beginPath();
+                ctx.moveTo(0, j * cellSize);
+                ctx.lineTo(cols * cellSize, j * cellSize); // Stop at cols * cellSize
+                ctx.stroke();
+            }
+        }
+
+        function drawLevel() {
+            for (let r = 0; r < rows; r++) {
+                for (let c = 0; c < cols; c++) {
+                    if (level && level[r][c] === 1) {
+                        ctx.fillStyle = "#888";
+                        ctx.fillRect(c * cellSize, r * cellSize, cellSize, cellSize);
+                    }
+                }
+            }
+        }
+
+        function drawBombs() {
+            bombs.forEach(bomb => {
+                ctx.beginPath();
+                ctx.arc(bomb.x * cellSize + cellSize / 2, bomb.y * cellSize + cellSize / 2, cellSize * 0.4, 0, 2 * Math.PI);
+                ctx.fillStyle = "black";
+                ctx.fill();
+                ctx.strokeStyle = "white";
+                ctx.stroke();
+            });
+        }
+
+        function drawExplosions() {
+            explosions.forEach(exp => {
+                exp.cells.forEach(cell => {
+                    ctx.fillStyle = "orange";
+                    ctx.fillRect(cell.x * cellSize, cell.y * cellSize, cellSize, cellSize);
+                });
+            });
+        }
+
+        function drawPlayers() {
+            for (let id in players) {
+                let p = players[id];
+                if (p.isDead) {
+                    ctx.fillStyle = "red";
+                    ctx.font = (cellSize * 0.8) + "px Arial";
+                    ctx.textAlign = "center";
+                    ctx.textBaseline = "middle";
+                    ctx.fillText("X", p.x * cellSize + cellSize / 2, p.y * cellSize + cellSize / 2);
+                } else {
+                    ctx.fillStyle = p.color;
+                    ctx.fillRect(p.x * cellSize, p.y * cellSize, cellSize, cellSize);
+                    let available = p.maxBombs - p.activeBombs;
+
+                    if (id !== localId) {
+                        // Big bomb count for other players
+                        ctx.fillStyle = "white";
+                        ctx.font = (cellSize * 0.6) + "px Arial"; // Larger font
+                        ctx.textAlign = "center";          // Center align
+                        ctx.textBaseline = "middle";       // Middle baseline
+                        ctx.fillText(available, p.x * cellSize + cellSize / 2, p.y * cellSize + cellSize / 2); // Draw in the center
+                    } else {
+                        // Small bomb count for local player (ME) - original style
+                        ctx.fillStyle = "white";
+                        ctx.font = "bold 14px Arial";
+                        ctx.textAlign = "left";
+                        ctx.textBaseline = "top";
+                        ctx.fillText(available, p.x * cellSize + 2, p.y * cellSize + 2);
+                        // For local player, draw an eyeball with a black pupil.
+                        ctx.fillStyle = "white";
+                        ctx.beginPath();
+                        // Draw the white eyeball.
+                        let eyeX = p.x * cellSize + cellSize * 0.7;
+                        let eyeY = p.y * cellSize + cellSize * 0.3;
+                        let eyeRadius = cellSize * 0.1;
+                        ctx.arc(eyeX, eyeY, eyeRadius, 0, 2 * Math.PI);
+                        ctx.fill();
+                        // Draw the black pupil inside.
+                        ctx.fillStyle = "black";
+                        ctx.beginPath();
+                        ctx.arc(eyeX, eyeY, eyeRadius * 0.5, 0, 2 * Math.PI);
+                        ctx.fill();
+                    }
+                }
+            }
+        }
+
+        function drawOrbs() {
+            let pulseFactor = (Math.sin(Date.now() / 200) + 1) / 2;
+            let hue = 30 + 30 * pulseFactor;
+            let orbColor = `hsl(${hue}, 100%, 50%)`;
+            orbs.forEach(orb => {
+                ctx.beginPath();
+                ctx.arc(orb.x * cellSize + cellSize / 2, orb.y * cellSize + cellSize / 2, cellSize * 0.375, 0, 2 * Math.PI);
+                ctx.fillStyle = orbColor;
+                ctx.shadowColor = orbColor;
+                ctx.shadowBlur = 15;
+                ctx.fill();
+                ctx.shadowBlur = 0;
+            });
+        }
+
+        requestAnimationFrame(gameLoop);
+    </script>
+</body>
+
+</html>
